@@ -11,18 +11,25 @@
 # - Remove source RAR volume sets only when extraction, conversion (when applicable), and destination copy succeed.
 # - Optionally delete standalone .nsp/.xci originals only after a verified output has been copied successfully.
 # - Timestamped diagnostic log, transcript, and per-archive WinRAR logs for troubleshooting.
+# - Work files are staged in a hidden folder inside the output folder, so finished files are moved into place
+#   by rename (no second full copy) and large extractions don't fill the system drive's %TEMP%.
 #
 # Usage examples:
 #   .\Extract-Parts.ps1
 #   .\Extract-Parts.ps1 -SourceFolder "C:\Games\Roms" -OutputFolder "C:\Games\Output" -DeleteArchives -DeleteStandalone
-#   .\Extract-Parts.ps1 -NonInteractive -DryRun
-#   .\Extract-Parts.ps1 -NonInteractive -DeleteArchives
+#   .\Extract-Parts.ps1 -NonInteractive -SourceFolder "D:\Roms" -DryRun
+#   .\Extract-Parts.ps1 -NonInteractive -SourceFolder "D:\Roms" -DeleteArchives
+#   .\Extract-Parts.ps1 -SourceFolder "D:\Roms" -MaxParallel 2
 #
 # Behavior:
 #   - If command-line flags are provided, they take precedence.
 #   - Otherwise, the script asks interactively to confirm deletions.
-#   - Non-interactive runs default to safe behavior and skip destructive cleanup unless explicitly enabled.
-#   - Dry-run mode previews the work without deleting anything.
+#   - -NonInteractive never shows dialogs or prompts: -SourceFolder is required, -OutputFolder defaults to
+#     <source>\Extracted, every yes/no prompt is answered "no", and duplicate filenames are skipped.
+#     Add -Force to auto-approve dependency installs (never deletions). Exit code is 1 if anything failed.
+#   - -DryRun only reports what would be processed; nothing is extracted, converted, installed, or deleted.
+#   - -NoDelete processes everything but never deletes source files.
+#   - -MaxParallel sets the number of concurrent WinRAR jobs (default 6; lower it for spinning hard drives).
 
 # --------------------------- Configuration ---------------------------
 param(
@@ -33,10 +40,10 @@ param(
     [switch]$DryRun,
     [switch]$NoDelete,
     [switch]$NonInteractive,
-    [switch]$Force
+    [switch]$Force,
+    [ValidateRange(1, 32)][int]$MaxParallel = 6
 )
 
-$MaxParallel = 6
 $QueuePreviewLimit = 12
 $DeleteArchivesOnSuccess = $null
 $DefaultOutputFolder = if ([string]::IsNullOrWhiteSpace($SourceFolder)) { Join-Path $env:USERPROFILE 'Extracted' } else { Join-Path $SourceFolder 'Extracted' }
@@ -46,7 +53,7 @@ $NszPythonVenvFolder = Join-Path $NszInstallFolder "venv"
 
 # ------------------------------ Setup -------------------------------
 $ErrorActionPreference = 'Stop'
-$script:OutputFolder = $null
+# Note: $script:OutputFolder is the -OutputFolder parameter itself (script-scope params share the scope), so it must not be reset here.
 $script:RarExe = $null
 $script:NszExe = $null
 $script:KeysFile = $null
@@ -58,17 +65,11 @@ $script:NoDelete = [bool]$NoDelete
 $script:NonInteractive = [bool]$NonInteractive
 $script:Force = [bool]$Force
 
-if ($DeleteArchives) {
-    $DeleteArchivesOnSuccess = $true
-}
-if ($DeleteStandalone) {
-    $script:DeleteStandaloneSources = $true
-}
-if ($script:DryRun -or $script:NoDelete) {
-    $DeleteArchivesOnSuccess = $false
-    $script:DeleteStandaloneSources = $false
-}
+# Deletion preferences are resolved after the scan, in the "Deletion preferences" section.
 $script:StopProcessing = $false
+$script:SuccessActions = @('Copy', 'Overwrite', 'KeepBoth')
+$script:StagingRoot = $null
+$script:LastActiveScanSummary = ''
 $script:OverwriteAll = $false
 $script:SkipAll = $false
 $script:KeepBothAll = $false
@@ -163,18 +164,30 @@ function Test-DeleteCandidate {
 function Read-YesNo {
     param(
         [Parameter(Mandatory)][string]$Prompt,
-        [bool]$DefaultNo = $true
+        [bool]$DefaultNo = $true,
+        # Non-destructive prompts (e.g. dependency installs) may be auto-approved by -NonInteractive -Force.
+        [switch]$AllowForce
     )
-    if ($script:NonInteractive -and -not $script:Force) {
-        Write-Host "Skipping interactive prompt in non-interactive mode: $Prompt" -ForegroundColor Yellow
-        Write-Log -Message "Skipped interactive prompt in non-interactive mode: '$Prompt'" -Level WARN
-        return $false
+    if ($script:NonInteractive) {
+        $autoAnswer = [bool]($script:Force -and $AllowForce)
+        Write-Host "Non-interactive mode: answering '$(if ($autoAnswer) { 'yes' } else { 'no' })' to: $Prompt" -ForegroundColor Yellow
+        Write-Log -Message "Non-interactive prompt auto-answered ($autoAnswer): '$Prompt'" -Level WARN
+        return $autoAnswer
     }
 
     $suffix = if ($DefaultNo) { '[y/N]' } else { '[Y/n]' }
-    $answer = (Read-Host "$Prompt $suffix").Trim()
-    if ([string]::IsNullOrWhiteSpace($answer)) { return (-not $DefaultNo) }
-    return ($answer -match '^(?i:y|yes)$')
+    while ($true) {
+        $answer = [string](Read-Host "$Prompt $suffix")
+        $answer = $answer.Trim()
+        if ([string]::IsNullOrWhiteSpace($answer)) { return (-not $DefaultNo) }
+        if ($answer -match '^(?i:y|yes)$') { return $true }
+        if ($answer -match '^(?i:n|no)$') { return $false }
+        Write-Host 'Please answer y or n.' -ForegroundColor Yellow
+    }
+}
+
+function Wait-ForExit {
+    if (-not $script:NonInteractive) { [void](Read-Host 'Press Enter to exit') }
 }
 
 function Resolve-RarExecutable {
@@ -196,7 +209,7 @@ function Resolve-RarExecutable {
 function Install-WinRAR {
     Write-Host "WinRAR's command-line executable is required to extract the RAR archives." -ForegroundColor Yellow
     Write-Host "The script can try to install WinRAR using the Windows package manager (winget)." -ForegroundColor Yellow
-    if (-not (Read-YesNo -Prompt 'Install WinRAR now using winget?')) { Write-Log -Message 'User declined WinRAR installation.' -Level WARN; return $null }
+    if (-not (Read-YesNo -Prompt 'Install WinRAR now using winget?' -AllowForce)) { Write-Log -Message 'User declined WinRAR installation.' -Level WARN; return $null }
 
     $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
     if (-not $winget) { $winget = Get-Command 'winget' -ErrorAction SilentlyContinue }
@@ -343,7 +356,7 @@ function Install-Nsz {
     Write-Host "NSZ is needed to convert .nsp to .nsz and .xci to .xcz." -ForegroundColor Yellow
     Write-Host "The standalone NSZ executable appears to be unreliable on some Windows systems. This fallback installs the official NSZ Python package in an isolated virtual environment." -ForegroundColor Yellow
     Write-Host "Installation folder: $NszPythonVenvFolder" -ForegroundColor Yellow
-    if (-not (Read-YesNo -Prompt 'Install NSZ and its required Python packages now?')) {
+    if (-not (Read-YesNo -Prompt 'Install NSZ and its required Python packages now?' -AllowForce)) {
         Write-Log -Message 'User declined NSZ installation.' -Level WARN
         return $null
     }
@@ -351,7 +364,7 @@ function Install-Nsz {
     $pythonPath = Resolve-PythonExecutable
     if (-not $pythonPath) {
         Write-Host 'Python 3.8+ was not found. The script can install Python 3.12 using winget first.' -ForegroundColor Yellow
-        if (-not (Read-YesNo -Prompt 'Install Python 3.12 using winget?')) {
+        if (-not (Read-YesNo -Prompt 'Install Python 3.12 using winget?' -AllowForce)) {
             Write-Log -Message 'Python installation was declined; NSZ will be unavailable.' -Level WARN
             return $null
         }
@@ -461,24 +474,47 @@ function Find-KeysFile {
 function Select-KeysFile {
     Write-Host ''
     Write-Host 'NSZ requires a compatible keys file that you must obtain legally. The script will not download keys.' -ForegroundColor Yellow
+    if ($script:NonInteractive) {
+        Write-Host 'Non-interactive mode: no keys file found in the default locations, so compression will be skipped.' -ForegroundColor Yellow
+        return $null
+    }
     Write-Host 'Choose an existing prod.keys or keys.txt file in the file picker, or cancel to skip compression.' -ForegroundColor Yellow
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
     $dialog.Title = 'Select your existing prod.keys or keys.txt file'
     $dialog.Filter = 'Switch keys files (prod.keys or keys.txt)|prod.keys;keys.txt|All files (*.*)|*.*'
     $dialog.CheckFileExists = $true
     $dialog.Multiselect = $false
-    $result = $dialog.ShowDialog()
-    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-        $chosen = $dialog.FileName
-        $leaf = [System.IO.Path]::GetFileName($chosen)
-        if (($leaf -ieq 'prod.keys' -or $leaf -ieq 'keys.txt') -and (Test-Path -LiteralPath $chosen -PathType Leaf)) {
-            $dialog.Dispose()
-            return $chosen
+    try {
+        while ((Show-DialogOnTop -Dialog $dialog) -eq [System.Windows.Forms.DialogResult]::OK) {
+            $chosen = $dialog.FileName
+            $leaf = [System.IO.Path]::GetFileName($chosen)
+            if (($leaf -ieq 'prod.keys' -or $leaf -ieq 'keys.txt') -and (Test-Path -LiteralPath $chosen -PathType Leaf)) {
+                return $chosen
+            }
+            Write-Host 'The selected file must be named prod.keys or keys.txt. Choose again, or cancel to skip compression.' -ForegroundColor Red
         }
-        Write-Host 'The selected file must be named prod.keys or keys.txt. Compression will be skipped.' -ForegroundColor Red
+        return $null
+    } finally {
+        $dialog.Dispose()
     }
-    $dialog.Dispose()
-    return $null
+}
+
+# Console-hosted dialogs often open behind the console window; a hidden TopMost owner brings them to the front.
+function Show-DialogOnTop {
+    param([Parameter(Mandatory)][System.Windows.Forms.CommonDialog]$Dialog)
+    $owner = New-Object System.Windows.Forms.Form
+    try {
+        $owner.TopMost = $true
+        $owner.ShowInTaskbar = $false
+        $owner.StartPosition = 'CenterScreen'
+        $owner.Size = New-Object System.Drawing.Size(1, 1)
+        $owner.Opacity = 0
+        $owner.Show()
+        $owner.Activate()
+        return $Dialog.ShowDialog($owner)
+    } finally {
+        $owner.Dispose()
+    }
 }
 
 function Select-Folder {
@@ -490,13 +526,15 @@ function Select-Folder {
     $dialog.Description = $Description
     $dialog.SelectedPath = $InitialFolder
     $dialog.ShowNewFolderButton = $true
-    $result = $dialog.ShowDialog()
-    $selected = $null
-    if ($result -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($dialog.SelectedPath)) {
-        $selected = $dialog.SelectedPath
+    try {
+        $result = Show-DialogOnTop -Dialog $dialog
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($dialog.SelectedPath)) {
+            return $dialog.SelectedPath
+        }
+        return $null
+    } finally {
+        $dialog.Dispose()
     }
-    $dialog.Dispose()
-    return $selected
 }
 
 function Get-ArchiveStarts {
@@ -543,7 +581,7 @@ function Get-EligibleFiles {
 function Get-ArchiveFilesToDelete {
     param([Parameter(Mandatory)][System.IO.FileInfo]$Archive)
 
-    $allFiles = @(Get-ChildItem -LiteralPath $SourceFolder -File -ErrorAction SilentlyContinue)
+    $allFiles = @(Get-ChildItem -LiteralPath $Archive.DirectoryName -File -ErrorAction SilentlyContinue)
     $partOne = [regex]::Match($Archive.Name, '^(?<base>.+)\.part0*1\.rar$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($partOne.Success) {
         $base = $partOne.Groups['base'].Value
@@ -572,58 +610,71 @@ function Get-UniqueDestinationPath {
     return $candidate
 }
 
-function Copy-FlatFile {
+# Moves a staged (temporary) file into the flat output folder. Sources are always throwaway files in the
+# staging area, so a move is used: on the same volume it is an instant rename instead of a full data copy.
+# Returns an object with Action ('Copy','Overwrite','KeepBoth','Skipped','Failed','Quit') and the actual Destination.
+function Move-FlatFile {
     param([Parameter(Mandatory)][System.IO.FileInfo]$File)
-    if ($script:StopProcessing) { return 'Quit' }
+    if ($script:StopProcessing) { return [pscustomobject]@{ Action = 'Quit'; Destination = $null } }
 
     $destination = Join-Path $script:OutputFolder $File.Name
-    Write-Log -Message "Destination handling started: source='$($File.FullName)'; target='$destination'; bytes=$($File.Length)." -Level DEBUG
-    $exists = Test-Path -LiteralPath $destination
+    $sourceLength = $File.Length
+    Write-Log -Message "Destination handling started: source='$($File.FullName)'; target='$destination'; bytes=$sourceLength." -Level DEBUG
     $action = 'Copy'
-    if ($exists) {
+    if (Test-Path -LiteralPath $destination) {
         if ($script:OverwriteAll) {
             $action = 'Overwrite'
-        } elseif ($script:SkipAll) {
+        } elseif ($script:SkipAll -or $script:NonInteractive) {
             $script:SkippedCount++
             Write-Host "Skipping duplicate: $($File.Name)" -ForegroundColor DarkYellow
-            Write-Log -Message "Duplicate skipped by SkipAll: '$destination'." -Level WARN
-            return 'Skipped'
+            Write-Log -Message "Duplicate skipped (SkipAll or non-interactive): '$destination'." -Level WARN
+            return [pscustomobject]@{ Action = 'Skipped'; Destination = $destination }
         } elseif ($script:KeepBothAll) {
-            $destination = Get-UniqueDestinationPath -Directory $script:OutputFolder -FileName $File.Name
             $action = 'KeepBoth'
         } else {
             Write-Host "`nDuplicate filename detected:" -ForegroundColor Yellow
             Write-Host "  Existing: $destination"
-            Write-Host "  Incoming: $($File.FullName)"
-            Write-Host 'Choose: [O]verwrite, [S]kip, [B] keep both, [A] overwrite all, [K] skip all, [L] keep both all, [Q] stop processing'
-            $choice = (Read-Host 'Choice').Trim().ToUpperInvariant()
+            Write-Host "  Incoming: $($File.Name) ($('{0:N1}' -f ($sourceLength / 1MB)) MB)"
+            $choice = $null
+            while ($choice -notin @('O', 'S', 'B', 'A', 'K', 'L', 'Q')) {
+                Write-Host 'Choose: [O]verwrite, [S]kip, [B] keep both, [A] overwrite all, [K] skip all, [L] keep both all, [Q] stop processing'
+                $choice = ([string](Read-Host 'Choice')).Trim().ToUpperInvariant()
+            }
             switch ($choice) {
                 'O' { $action = 'Overwrite' }
-                'S' { $script:SkippedCount++; Write-Log -Message "Duplicate skipped by user: '$destination'." -Level WARN; return 'Skipped' }
-                'B' { $destination = Get-UniqueDestinationPath -Directory $script:OutputFolder -FileName $File.Name; $action = 'KeepBoth' }
+                'B' { $action = 'KeepBoth' }
                 'A' { $script:OverwriteAll = $true; $action = 'Overwrite' }
-                'K' { $script:SkipAll = $true; $script:SkippedCount++; Write-Log -Message "Duplicate skipped; SkipAll selected: '$destination'." -Level WARN; return 'Skipped' }
-                'L' { $script:KeepBothAll = $true; $destination = Get-UniqueDestinationPath -Directory $script:OutputFolder -FileName $File.Name; $action = 'KeepBoth' }
-                'Q' { $script:StopProcessing = $true; Write-Log -Message "User selected Q during duplicate handling for '$($File.Name)'." -Level WARN; return 'Quit' }
-                default { Write-Host 'Unrecognized choice; skipping this file.' -ForegroundColor Yellow; $script:SkippedCount++; return 'Skipped' }
+                'L' { $script:KeepBothAll = $true; $action = 'KeepBoth' }
+                'K' { $script:SkipAll = $true }
+                'Q' { $script:StopProcessing = $true; Write-Log -Message "User selected Q during duplicate handling for '$($File.Name)'." -Level WARN; return [pscustomobject]@{ Action = 'Quit'; Destination = $null } }
+            }
+            if ($choice -in @('S', 'K')) {
+                $script:SkippedCount++
+                Write-Log -Message "Duplicate skipped by user (choice $choice): '$destination'." -Level WARN
+                return [pscustomobject]@{ Action = 'Skipped'; Destination = $destination }
             }
         }
+        if ($action -eq 'KeepBoth') { $destination = Get-UniqueDestinationPath -Directory $script:OutputFolder -FileName $File.Name }
     }
 
     try {
         if ($action -eq 'Overwrite') {
-            Copy-Item -LiteralPath $File.FullName -Destination $destination -Force -ErrorAction Stop
+            Move-Item -LiteralPath $File.FullName -Destination $destination -Force -ErrorAction Stop
         } else {
-            Copy-Item -LiteralPath $File.FullName -Destination $destination -ErrorAction Stop
+            Move-Item -LiteralPath $File.FullName -Destination $destination -ErrorAction Stop
+        }
+        $written = Get-Item -LiteralPath $destination -ErrorAction Stop
+        if ($written.Length -ne $sourceLength) {
+            throw "Size mismatch after move: expected $sourceLength bytes, found $($written.Length) bytes."
         }
         $script:CopiedCount++
-        Write-Log -Message "Copy $action succeeded: '$($File.FullName)' -> '$destination' ($($File.Length) bytes)." -Level INFO
-        return $action
+        Write-Log -Message "Move $action succeeded: '$($File.FullName)' -> '$destination' ($sourceLength bytes)." -Level INFO
+        return [pscustomobject]@{ Action = $action; Destination = $destination }
     } catch {
         $script:FailedCopyCount++
-        Write-Log -Message "Copy failed: source='$($File.FullName)'; destination='$destination'; exception=$($_ | Out-String)" -Level ERROR
+        Write-Log -Message "Move failed: source='$($File.FullName)'; destination='$destination'; exception=$($_ | Out-String)" -Level ERROR
         Write-Host "Copy failed for '$($File.Name)': $($_.Exception.Message)" -ForegroundColor Red
-        return 'Failed'
+        return [pscustomobject]@{ Action = 'Failed'; Destination = $null }
     }
 }
 
@@ -673,11 +724,12 @@ $script:ExtractionWorker = {
         if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) { throw "Archive file not found: $ArchivePath" }
         if (-not (Test-Path -LiteralPath $TempFolder -PathType Container)) { throw "Temporary extraction folder not found: $TempFolder" }
         $targetPath = $TempFolder.TrimEnd('\') + '\'
-        $commandDescription = "& `"$Executable`" x -y `"$ArchivePath`" `"$targetPath`""
+        $commandDescription = "& `"$Executable`" x -y -p- `"$ArchivePath`" `"$targetPath`""
         Add-WorkerLogLine "Command=$commandDescription"
         Add-WorkerLogLine 'WinRAR output begins:'
         # Do not use -idq: capture normal command output for troubleshooting. The job keeps it off the interactive console.
-        $toolOutput = @(& $Executable x -y $ArchivePath $targetPath 2>&1 | ForEach-Object { [string]$_ })
+        # -p- stops WinRAR from asking for a password, which would hang forever in a job with no console.
+        $toolOutput = @(& $Executable x -y -p- $ArchivePath $targetPath 2>&1 | ForEach-Object { [string]$_ })
         $nativeCode = $LASTEXITCODE
         foreach ($line in $toolOutput) { Add-WorkerLogLine ([string]$line) }
         if ($null -eq $nativeCode) {
@@ -705,23 +757,55 @@ $script:ExtractionWorker = {
     }
 }
 
+# Temporary work folders live on the output folder's volume so finished files can be moved into place by rename
+# instead of being copied again (and so large extractions don't fill a small system drive under %TEMP%).
+function New-StagingFolder {
+    param([Parameter(Mandatory)][string]$Prefix)
+    if (-not $script:StagingRoot) {
+        $script:StagingRoot = Join-Path $script:OutputFolder ('.ExtractParts_staging_{0}' -f $script:RunId)
+    }
+    if (-not (Test-Path -LiteralPath $script:StagingRoot -PathType Container)) {
+        $root = New-Item -ItemType Directory -Path $script:StagingRoot -Force
+        try { $root.Attributes = $root.Attributes -bor [System.IO.FileAttributes]::Hidden } catch {}
+    }
+    $folder = Join-Path $script:StagingRoot ('{0}_{1}' -f $Prefix, ([guid]::NewGuid().ToString('N')))
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    return $folder
+}
+
+function Remove-StagingRoot {
+    if ($script:StagingRoot -and (Test-Path -LiteralPath $script:StagingRoot)) {
+        Remove-Item -LiteralPath $script:StagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-RunningExtractionCount {
+    @($script:Active | Where-Object { $_.Job.State -notin @('Completed', 'Failed', 'Stopped') }).Count
+}
+
+# Keeps up to $MaxParallel extraction jobs running. Safe to call while other work (e.g. NSZ) is in progress.
+function Start-PendingExtractions {
+    if ($script:StopProcessing) { return }
+    while ((Get-RunningExtractionCount) -lt $MaxParallel -and $script:NextArchiveIndex -lt $script:Archives.Count) { Start-NextExtraction }
+}
+
 function Start-NextExtraction {
     if ($script:NextArchiveIndex -ge $script:Archives.Count) { return }
     $archive = $script:Archives[$script:NextArchiveIndex]
     $queueNumber = $script:NextArchiveIndex + 1
     $script:NextArchiveIndex++
-    $tempFolder = Join-Path $env:TEMP ("ArchiveExtract_{0}" -f ([guid]::NewGuid().ToString('N')))
-    New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
+    $tempFolder = $null
     $safeName = [regex]::Replace([System.IO.Path]::GetFileNameWithoutExtension($archive.Name), '[^A-Za-z0-9._-]', '_')
     $workerLogPath = Join-Path $script:RunLogFolder ("RAR_{0:D3}_{1}_{2}.log" -f $queueNumber, $safeName, ([guid]::NewGuid().ToString('N').Substring(0,8)))
     try {
+        $tempFolder = New-StagingFolder -Prefix 'extract'
         Set-Content -LiteralPath $workerLogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] RAR worker log for '$($archive.Name)'" -Encoding UTF8
         $job = Start-Job -ScriptBlock $script:ExtractionWorker -ArgumentList $script:RarExe, $archive.FullName, $tempFolder, $workerLogPath -ErrorAction Stop
         $script:Active += [pscustomobject]@{ Archive = $archive; TempFolder = $tempFolder; Job = $job; LogPath = $workerLogPath; QueueNumber = $queueNumber }
         Write-Host "Started extraction [$queueNumber/$($script:TotalArchives)]: $($archive.Name) (job $($job.Id))" -ForegroundColor Cyan
-        Write-Log -Message "Started parallel extraction queue #$queueNumber/$($script:TotalArchives): archive='$($archive.FullName)'; jobId=$($job.Id); temp='$tempFolder'; workerLog='$workerLogPath'. Active=$($script:Active.Count)/$MaxParallel" -Level INFO
+        Write-Log -Message "Started parallel extraction queue #$queueNumber/$($script:TotalArchives): archive='$($archive.FullName)'; jobId=$($job.Id); temp='$tempFolder'; workerLog='$workerLogPath'. Running=$(Get-RunningExtractionCount)/$MaxParallel" -Level INFO
     } catch {
-        if (Test-Path -LiteralPath $tempFolder) { Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($tempFolder -and (Test-Path -LiteralPath $tempFolder)) { Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue }
         $script:ErrorCount++
         $script:CompletedArchives++
         Write-Host "Could not start extraction for $($archive.Name): $($_.Exception.Message)" -ForegroundColor Red
@@ -737,16 +821,12 @@ function Remove-ExtractionTemp {
     }
 }
 
-function Get-PendingArchiveItems {
-    $items = @()
-    for ($i = $script:NextArchiveIndex; $i -lt $script:Archives.Count; $i++) { $items += $script:Archives[$i] }
-    return $items
-}
-
-function Get-PendingStandaloneItems {
-    $items = @()
-    for ($i = $script:StandaloneNextIndex; $i -lt $script:StandaloneQueue.Count; $i++) { $items += $script:StandaloneQueue[$i] }
-    return $items
+# Returns only the slice of the queue the dashboard displays, rather than copying the whole pending list on every refresh.
+function Get-QueueSlice {
+    param([object[]]$Queue, [int]$Start, [int]$Count)
+    if ($null -eq $Queue -or $Start -ge $Queue.Count -or $Count -le 0) { return @() }
+    $end = [Math]::Min($Queue.Count, $Start + $Count) - 1
+    return @($Queue[$Start..$end])
 }
 
 function Get-ProgressJobSummary {
@@ -774,43 +854,44 @@ function Get-ProgressJobSummary {
 }
 
 function Update-ProgressDashboard {
-    $pendingItems = @()
-    $activeBytes = [int64]0
-    $activeFiles = 0
-
     if ($script:ProgressStage -eq 'Archives') {
-        $pendingItems = @(Get-PendingArchiveItems)
+        $pendingCount = [Math]::Max(0, $script:Archives.Count - $script:NextArchiveIndex)
+        $pendingItems = Get-QueueSlice -Queue $script:Archives -Start $script:NextArchiveIndex -Count $QueuePreviewLimit
         $jobSummary = Get-ProgressJobSummary
         $percent = if ($script:TotalArchives -gt 0) { [int](100 * $script:CompletedArchives / $script:TotalArchives) } else { 100 }
-        $status = "Processed $($script:CompletedArchives)/$($script:TotalArchives); active jobs $($script:Active.Count)/$MaxParallel; running $($jobSummary.Running); failed $($jobSummary.Failed); stopped $($jobSummary.Stopped)"
+        $status = "Processed $($script:CompletedArchives)/$($script:TotalArchives); running $($jobSummary.Running)/$MaxParallel; failed $($jobSummary.Failed); stopped $($jobSummary.Stopped)"
         if (-not [string]::IsNullOrWhiteSpace($script:CurrentWork)) { $status += "; current: $($script:CurrentWork)" }
         Write-Progress -Id 0 -Activity 'Extracting RAR archives in parallel' -Status $status -PercentComplete $percent
 
+        # Rescanning the staging folders is disk I/O, so do it at most once per second and cache the result.
+        if (((Get-Date) - $script:LastProgressScan).TotalSeconds -ge 1) {
+            $script:LastProgressScan = Get-Date
+            $activeBytes = [int64]0
+            $activeFiles = 0
+            foreach ($entry in $script:Active) {
+                foreach ($f in (Get-EligibleFiles -Folder $entry.TempFolder)) {
+                    $activeFiles++
+                    $activeBytes += [int64]$f.Length
+                }
+            }
+            $script:LastActiveScanSummary = '{0} file(s), {1:N1} MB extracted so far' -f $activeFiles, ($activeBytes / 1MB)
+        }
         $activeDetails = if ($jobSummary.Names.Count -gt 0) { $jobSummary.Names -join '; ' } else { 'No active archive jobs' }
+        if ($script:LastActiveScanSummary) { $activeDetails = "$($script:LastActiveScanSummary) | $activeDetails" }
         Write-Progress -Id 1 -ParentId 0 -Activity 'Active extraction jobs' -Status $activeDetails -PercentComplete 0
     } else {
-        $pendingItems = @(Get-PendingStandaloneItems)
+        $pendingCount = [Math]::Max(0, $script:StandaloneQueue.Count - $script:StandaloneNextIndex)
+        $pendingItems = Get-QueueSlice -Queue $script:StandaloneQueue -Start $script:StandaloneNextIndex -Count $QueuePreviewLimit
         $percent = if ($script:TotalStandalone -gt 0) { [int](100 * $script:StandaloneProcessedCount / $script:TotalStandalone) } else { 100 }
         $status = "Processed $($script:StandaloneProcessedCount)/$($script:TotalStandalone) standalone files"
         if (-not [string]::IsNullOrWhiteSpace($script:CurrentWork)) { $status += "; current: $($script:CurrentWork)" }
         Write-Progress -Id 0 -Activity 'Compressing previously extracted NSP/XCI files' -Status $status -PercentComplete $percent
-        Write-Progress -Id 1 -ParentId 0 -Activity 'Active conversions' -Status ($script:CurrentWork) -PercentComplete 0
-    }
-
-    if ($script:ProgressStage -eq 'Archives' -and (((Get-Date) - $script:LastProgressScan).TotalSeconds -ge 1)) {
-        $script:LastProgressScan = Get-Date
-        foreach ($entry in $script:Active) {
-            foreach ($f in (Get-EligibleFiles -Folder $entry.TempFolder)) {
-                $activeFiles++
-                $activeBytes += [int64]$f.Length
-            }
-        }
-        $statusChild = "Temporary files: $activeFiles; extracted bytes observed: {0:N1} MB" -f ($activeBytes / 1MB)
-        Write-Progress -Id 1 -ParentId 0 -Activity 'Active extraction jobs' -Status ($statusChild) -PercentComplete 0
+        $conversionStatus = if ([string]::IsNullOrWhiteSpace($script:CurrentWork)) { 'Idle' } else { $script:CurrentWork }
+        Write-Progress -Id 1 -ParentId 0 -Activity 'Active conversions' -Status $conversionStatus -PercentComplete 0
     }
 
     $currentQueueProgressIds = @()
-    $visibleQueueCount = [Math]::Min($QueuePreviewLimit, $pendingItems.Count)
+    $visibleQueueCount = $pendingItems.Count
     for ($slot = 0; $slot -lt $visibleQueueCount; $slot++) {
         $queueId = 2 + $slot
         $currentQueueProgressIds += $queueId
@@ -822,17 +903,15 @@ function Update-ProgressDashboard {
             $queueActivity = 'WAITING #{0:D2}/{1:D2}' -f $queueOrdinal, $script:TotalStandalone
         }
 
-        $details = $pendingItems[$slot].Name
-        if ($pendingItems[$slot].PSObject.Properties['Length']) {
-            $details = "$details • {0:N1} MB" -f ([double]$pendingItems[$slot].Length / 1MB)
-        }
+        # Format arguments (not string interpolation) so braces in filenames can't break -f.
+        $details = '{0} - {1:N1} MB' -f $pendingItems[$slot].Name, ([double]$pendingItems[$slot].Length / 1MB)
 
         Write-Progress -Id $queueId -ParentId 0 -Activity $queueActivity -Status $details -PercentComplete 0
     }
-    if ($pendingItems.Count -gt $QueuePreviewLimit) {
+    if ($pendingCount -gt $QueuePreviewLimit) {
         $overflowId = 2 + $QueuePreviewLimit
         $currentQueueProgressIds += $overflowId
-        $overflowCount = $pendingItems.Count - $QueuePreviewLimit
+        $overflowCount = $pendingCount - $QueuePreviewLimit
         Write-Progress -Id $overflowId -ParentId 0 -Activity 'WAITING: additional files' -Status ("... and {0} more queued" -f $overflowCount) -PercentComplete 0
     }
 
@@ -861,8 +940,7 @@ function Invoke-NSZConversion {
     param([Parameter(Mandatory)][System.IO.FileInfo]$File)
 
     $expectedExtension = if ($File.Extension -ieq '.nsp') { '.nsz' } elseif ($File.Extension -ieq '.xci') { '.xcz' } else { return $null }
-    $workFolder = Join-Path $env:TEMP ("NszOutput_{0}" -f ([guid]::NewGuid().ToString('N')))
-    New-Item -ItemType Directory -Path $workFolder -Force | Out-Null
+    $workFolder = New-StagingFolder -Prefix 'nsz'
 
     $script:CurrentWork = "Compressing $($File.Extension.ToUpperInvariant()) to $($expectedExtension.ToUpperInvariant()): $($File.Name)"
     Write-Log -Message "Starting NSZ conversion: executable='$script:NszExe'; source='$($File.FullName)'; targetExtension='$expectedExtension'; keys='$script:KeysFile'; workFolder='$workFolder'." -Level INFO
@@ -871,6 +949,8 @@ function Invoke-NSZConversion {
         # --verify is paired with --keep as required by the NSZ CLI documentation.
         $job = Start-Job -ScriptBlock $script:NszWorker -ArgumentList $script:NszExe, $File.FullName, $workFolder, $script:KeysFile
         while ($job.State -in @('NotStarted', 'Running', 'Blocked', 'Disconnected')) {
+            # Keep extraction slots busy while this (often long) conversion runs.
+            if ($script:ProgressStage -eq 'Archives') { Start-PendingExtractions }
             Update-ProgressDashboard
             Start-Sleep -Milliseconds 400
         }
@@ -910,7 +990,6 @@ function Invoke-NSZConversion {
         if ($script:ProgressStage -eq 'Archives') {
             Write-Host 'The source RAR archive will be kept because conversion did not complete successfully.' -ForegroundColor Yellow
         }
-        if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null }
         if (Test-Path -LiteralPath $workFolder) { Remove-Item -LiteralPath $workFolder -Recurse -Force -ErrorAction SilentlyContinue }
         return [pscustomobject]@{ Success = $false; OutputFile = $null; WorkFolder = $null; Message = $_.Exception.Message }
     } finally {
@@ -918,38 +997,36 @@ function Invoke-NSZConversion {
     }
 }
 
+# Returns the Move-FlatFile result object (Action + Destination).
 function Process-OneFile {
     param(
         [Parameter(Mandatory)][System.IO.FileInfo]$File,
         [bool]$IsStandalone = $false
     )
-    if ($script:StopProcessing) { return 'Quit' }
+    if ($script:StopProcessing) { return [pscustomobject]@{ Action = 'Quit'; Destination = $null } }
 
     if ($script:CompressionEnabled -and $File.Extension -in @('.nsp', '.xci')) {
         $conversion = Invoke-NSZConversion -File $File
-        if (-not $conversion -or -not $conversion.Success) { return 'Failed' }
+        if (-not $conversion -or -not $conversion.Success) { return [pscustomobject]@{ Action = 'Failed'; Destination = $null } }
         try {
-            $copyResult = Copy-FlatFile -File $conversion.OutputFile
-            if ($copyResult -in @('Copy', 'Overwrite', 'KeepBoth')) {
-                if ($IsStandalone -and $script:DeleteStandaloneSources -and (Test-DeleteAllowed)) {
-                    $destinationPath = Join-Path $script:OutputFolder $conversion.OutputFile.Name
-                    if (-not (Test-DeleteCandidate -SourcePath $File.FullName -RequiredOutputs @($destinationPath))) {
-                        Write-Host "Compressed output missing or invalid; original standalone file kept: $($File.Name)" -ForegroundColor Yellow
-                        Write-Log -Message "Delete skipped for standalone '$($File.FullName)' because verification failed for output '$destinationPath'." -Level WARN
-                    } else {
-                        try {
-                            Remove-Item -LiteralPath $File.FullName -Force -ErrorAction Stop
-                            Write-Host "Compressed and deleted original: $($File.Name)" -ForegroundColor Green
-                        } catch {
-                            Write-Host "Compressed output saved, but original could not be deleted ('$($File.Name)'): $($_.Exception.Message)" -ForegroundColor Yellow
-                        }
-                    }
-                } elseif ($IsStandalone -and $script:DeleteStandaloneSources -and -not (Test-DeleteAllowed)) {
+            $moveResult = Move-FlatFile -File $conversion.OutputFile
+            if ($IsStandalone -and $script:DeleteStandaloneSources -and $moveResult.Action -in $script:SuccessActions) {
+                if (-not (Test-DeleteAllowed)) {
                     Write-Host "Dry-run/no-delete mode enabled; original standalone file kept: $($File.Name)" -ForegroundColor Yellow
+                } elseif (-not (Test-DeleteCandidate -SourcePath $File.FullName -RequiredOutputs @($moveResult.Destination))) {
+                    Write-Host "Compressed output missing or invalid; original standalone file kept: $($File.Name)" -ForegroundColor Yellow
+                    Write-Log -Message "Delete skipped for standalone '$($File.FullName)' because verification failed for output '$($moveResult.Destination)'." -Level WARN
+                } else {
+                    try {
+                        Remove-Item -LiteralPath $File.FullName -Force -ErrorAction Stop
+                        Write-Host "Compressed and deleted original: $($File.Name)" -ForegroundColor Green
+                        Write-Log -Message "Deleted standalone source '$($File.FullName)' after verified output '$($moveResult.Destination)'." -Level INFO
+                    } catch {
+                        Write-Host "Compressed output saved, but original could not be deleted ('$($File.Name)'): $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
                 }
-                return $copyResult
             }
-            return $copyResult
+            return $moveResult
         } finally {
             if ($conversion.WorkFolder -and (Test-Path -LiteralPath $conversion.WorkFolder)) {
                 Remove-Item -LiteralPath $conversion.WorkFolder -Recurse -Force -ErrorAction SilentlyContinue
@@ -957,7 +1034,7 @@ function Process-OneFile {
         }
     }
 
-    return (Copy-FlatFile -File $File)
+    return (Move-FlatFile -File $File)
 }
 
 function Process-FinishedArchive {
@@ -1054,21 +1131,23 @@ function Process-FinishedArchive {
     }
 
     $allFilesHandled = $true
+    # The actual written paths (e.g. 'game.nsz' for 'game.nsp', or 'file (2).ext' for keep-both) are what must be verified.
+    $requiredOutputPaths = @()
     foreach ($file in $eligibleFiles) {
         if ($script:StopProcessing) { $allFilesHandled = $false; break }
         Write-Log -Message "Handling extracted file '$($file.FullName)' ($($file.Length) bytes). CompressionEnabled=$($script:CompressionEnabled)." -Level INFO
         $result = Process-OneFile -File $file -IsStandalone:$false
-        Write-Log -Message "Handled extracted file '$($file.Name)': result='$result'." -Level INFO
-        if ($result -notin @('Copy', 'Overwrite', 'KeepBoth')) { $allFilesHandled = $false }
+        Write-Log -Message "Handled extracted file '$($file.Name)': result='$($result.Action)'; destination='$($result.Destination)'." -Level INFO
+        if ($result.Action -in $script:SuccessActions) {
+            $requiredOutputPaths += $result.Destination
+        } else {
+            $allFilesHandled = $false
+        }
     }
 
     if ($DeleteArchivesOnSuccess -and $allFilesHandled -and -not $script:StopProcessing -and (Test-DeleteAllowed)) {
         $volumeFiles = @(Get-ArchiveFilesToDelete -Archive $Entry.Archive)
         $deleteFailure = $false
-        $requiredOutputPaths = @()
-        foreach ($file in $eligibleFiles) {
-            $requiredOutputPaths += (Join-Path $script:OutputFolder $file.Name)
-        }
 
         Write-Log -Message "Archive content handling succeeded for '$($Entry.Archive.Name)'; attempting to delete source volumes: $($volumeFiles.Name -join ', ')." -Level INFO
         foreach ($volume in $volumeFiles) {
@@ -1094,14 +1173,12 @@ function Process-FinishedArchive {
             $script:WarningCount++
             Write-Host "Output succeeded, but one or more source volume files could not be deleted for: $($Entry.Archive.Name)" -ForegroundColor Yellow
         }
+    } elseif ($allFilesHandled -and -not $script:StopProcessing) {
+        Write-Host "Extracted: $($Entry.Archive.Name) ($($requiredOutputPaths.Count) file(s)); source archive kept." -ForegroundColor Green
+        Write-Log -Message "Source archive kept (deletion not enabled): '$($Entry.Archive.Name)'" -Level INFO
     } else {
-        if (-not (Test-DeleteAllowed)) {
-            Write-Host "Keeping source archive: $($Entry.Archive.Name) (dry-run/no-delete mode is enabled)." -ForegroundColor Yellow
-            Write-Log -Message "Source archive kept because dry-run/no-delete mode is enabled: '$($Entry.Archive.Name)'" -Level WARN
-        } else {
-            Write-Host "Keeping source archive: $($Entry.Archive.Name) (one or more files failed, were skipped, or processing was stopped)." -ForegroundColor Yellow
-            Write-Log -Message "Source archive kept because not all eligible files were copied/converted without skips or errors: '$($Entry.Archive.Name)'" -Level WARN
-        }
+        Write-Host "Keeping source archive: $($Entry.Archive.Name) (one or more files failed, were skipped, or processing was stopped)." -ForegroundColor Yellow
+        Write-Log -Message "Source archive kept because not all eligible files were copied/converted without skips or errors: '$($Entry.Archive.Name)'" -Level WARN
     }
 
     Remove-ExtractionTemp -Folder $Entry.TempFolder -Job $Entry.Job
@@ -1109,15 +1186,25 @@ function Process-FinishedArchive {
 }
 
 # ------------------------ Input and destination ------------------------
-try { Add-Type -AssemblyName System.Windows.Forms } catch {
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+} catch {
     Write-Host 'Unable to load Windows Forms for the folder/file pickers.' -ForegroundColor Red
     Write-Log -Message 'Unable to load System.Windows.Forms. Exiting.' -Level ERROR
-    Read-Host 'Press Enter to exit'
+    Wait-ForExit
     Stop-RunLogging
     exit 1
 }
 
 if ([string]::IsNullOrWhiteSpace($SourceFolder) -or -not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
+    if ($script:NonInteractive) {
+        Write-Host "Non-interactive mode requires a valid -SourceFolder. Given: '$SourceFolder'" -ForegroundColor Red
+        Write-Log -Message "Non-interactive run without a valid source folder ('$SourceFolder'). Exiting." -Level ERROR
+        Stop-RunLogging
+        exit 1
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SourceFolder)) { Write-Host "Source folder not found: $SourceFolder" -ForegroundColor Yellow }
     $sourcePromptInitial = if ([string]::IsNullOrWhiteSpace($SourceFolder)) { $env:USERPROFILE } else { $SourceFolder }
     $sourceChoice = Select-Folder -Description 'Choose the folder that contains your RAR archive sets or loose .nsp/.xci files.' -InitialFolder $sourcePromptInitial
     if ([string]::IsNullOrWhiteSpace($sourceChoice)) {
@@ -1129,27 +1216,51 @@ if ([string]::IsNullOrWhiteSpace($SourceFolder) -or -not (Test-Path -LiteralPath
     $SourceFolder = $sourceChoice
     $DefaultOutputFolder = Join-Path $SourceFolder 'Extracted'
 }
-
-if (-not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
-    Write-Host "Source folder not found: $SourceFolder" -ForegroundColor Red
-    Write-Log -Message "Source folder not found: '$SourceFolder'. Exiting." -Level ERROR
-    Read-Host 'Press Enter to exit'
-    Stop-RunLogging
-    exit 1
-}
+$SourceFolder = [System.IO.Path]::GetFullPath($SourceFolder)
+Write-Log -Message "Source folder: '$SourceFolder'." -Level INFO
 
 $detectedArchives = @(Get-ArchiveStarts -Folder $SourceFolder)
 Write-Log -Message "Detected $($detectedArchives.Count) archive set(s) directly in source folder '$SourceFolder'." -Level INFO
-New-Item -ItemType Directory -Path $DefaultOutputFolder -Force | Out-Null
-$outputChoice = Select-Folder -Description 'Choose the destination for extracted and compressed files. Eligible files are flattened into this folder.' -InitialFolder $DefaultOutputFolder
-if ([string]::IsNullOrWhiteSpace($outputChoice)) {
-    Write-Host 'Cancelled. No files were processed.' -ForegroundColor Yellow
-    Write-Log -Message 'User cancelled destination selection; no files processed.' -Level WARN
-    Stop-RunLogging
-    exit 0
+
+if (-not [string]::IsNullOrWhiteSpace($script:OutputFolder)) {
+    Write-Log -Message "Using -OutputFolder from the command line: '$script:OutputFolder'." -Level INFO
+} elseif ($script:NonInteractive) {
+    $script:OutputFolder = $DefaultOutputFolder
+    Write-Host "Non-interactive mode: using default output folder $script:OutputFolder" -ForegroundColor Yellow
+} else {
+    # Pre-create the suggested folder so the picker can open on it, but remove it again if it is not chosen.
+    $createdDefaultOutput = $false
+    if (-not (Test-Path -LiteralPath $DefaultOutputFolder)) {
+        try { New-Item -ItemType Directory -Path $DefaultOutputFolder -Force -ErrorAction Stop | Out-Null; $createdDefaultOutput = $true } catch {}
+    }
+    $outputInitial = if (Test-Path -LiteralPath $DefaultOutputFolder -PathType Container) { $DefaultOutputFolder } else { $SourceFolder }
+    $outputChoice = Select-Folder -Description 'Choose the destination for extracted and compressed files. Eligible files are flattened into this folder.' -InitialFolder $outputInitial
+    $chosePrecreated = (-not [string]::IsNullOrWhiteSpace($outputChoice)) -and ([System.IO.Path]::GetFullPath($outputChoice).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($DefaultOutputFolder).TrimEnd('\'))
+    if ($createdDefaultOutput -and (-not $chosePrecreated -or $script:DryRun)) {
+        if (-not (Get-ChildItem -LiteralPath $DefaultOutputFolder -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $DefaultOutputFolder -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($outputChoice)) {
+        Write-Host 'Cancelled. No files were processed.' -ForegroundColor Yellow
+        Write-Log -Message 'User cancelled destination selection; no files processed.' -Level WARN
+        Stop-RunLogging
+        exit 0
+    }
+    $script:OutputFolder = $outputChoice
 }
-$script:OutputFolder = $outputChoice
-New-Item -ItemType Directory -Path $script:OutputFolder -Force | Out-Null
+$script:OutputFolder = [System.IO.Path]::GetFullPath($script:OutputFolder)
+if (-not $script:DryRun) {
+    try {
+        New-Item -ItemType Directory -Path $script:OutputFolder -Force -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "Could not create the output folder '$script:OutputFolder': $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log -Message "Could not create output folder '$script:OutputFolder': $($_ | Out-String)" -Level ERROR
+        Wait-ForExit
+        Stop-RunLogging
+        exit 1
+    }
+}
 
 $looseScanFolders = @($SourceFolder, $script:OutputFolder)
 if (Read-YesNo -Prompt 'Would you like to scan another folder for previously extracted .nsp/.xci files to compress?') {
@@ -1167,10 +1278,11 @@ $looseCandidates = @(Get-LooseGameFiles -Folders $uniqueFolders)
 Write-Log -Message "Scanned loose-file folders: $($uniqueFolders -join '; '); standalone NSP/XCI candidates=$($looseCandidates.Count)." -Level INFO
 
 # -------------------------- Dependency checks --------------------------
+# A dry run only reports what is missing; it never installs anything.
 $archiveProcessingEnabled = ($detectedArchives.Count -gt 0)
 if ($archiveProcessingEnabled) {
     $script:RarExe = Resolve-RarExecutable
-    if (-not $script:RarExe) { Write-Log -Message 'WinRAR command-line executable not found; asking to install it.' -Level WARN; $script:RarExe = Install-WinRAR }
+    if (-not $script:RarExe -and -not $script:DryRun) { Write-Log -Message 'WinRAR command-line executable not found; asking to install it.' -Level WARN; $script:RarExe = Install-WinRAR }
     if ($script:RarExe) { Write-Log -Message "Using WinRAR executable '$script:RarExe'." -Level INFO }
     if (-not $script:RarExe) {
         $archiveProcessingEnabled = $false
@@ -1178,14 +1290,14 @@ if ($archiveProcessingEnabled) {
     }
 }
 
-$needsCompression = (($archiveProcessingEnabled -and $detectedArchives.Count -gt 0) -or $looseCandidates.Count -gt 0)
+$needsCompression = ($archiveProcessingEnabled -or $looseCandidates.Count -gt 0)
 if ($needsCompression) {
     $script:NszExe = Resolve-NszExecutable
-    if (-not $script:NszExe) { Write-Log -Message 'No working NSZ CLI was detected; asking to install NSZ into an isolated Python environment.' -Level WARN; $script:NszExe = Install-Nsz }
-    if ($script:NszExe) { Write-Log -Message "Using NSZ executable '$script:NszExe'." -Level INFO }
+    if (-not $script:NszExe -and -not $script:DryRun) { Write-Log -Message 'No working NSZ CLI was detected; asking to install NSZ into an isolated Python environment.' -Level WARN; $script:NszExe = Install-Nsz }
     if ($script:NszExe) {
+        Write-Log -Message "Using NSZ executable '$script:NszExe'." -Level INFO
         $script:KeysFile = Find-KeysFile
-        if (-not $script:KeysFile) { $script:KeysFile = Select-KeysFile }
+        if (-not $script:KeysFile -and -not $script:DryRun) { $script:KeysFile = Select-KeysFile }
         if ($script:KeysFile) {
             $script:CompressionEnabled = $true
             Write-Log -Message "Compression enabled with NSZ='$script:NszExe' and keys='$script:KeysFile'." -Level INFO
@@ -1204,64 +1316,58 @@ if ($script:CompressionEnabled) {
     $script:TotalStandalone = $script:StandaloneQueue.Count
 }
 
+# ------------------------- Deletion preferences -------------------------
+# Command-line flags win; otherwise ask. Dry-run/no-delete always wins over both.
 if ($script:CompressionEnabled -and $script:TotalStandalone -gt 0) {
     Write-Host "Found $($script:TotalStandalone) existing .nsp/.xci file(s) to convert." -ForegroundColor Cyan
-    if ($script:DryRun -or $script:NoDelete) {
+    if (-not (Test-DeleteAllowed)) {
         $script:DeleteStandaloneSources = $false
-        Write-Host 'Dry-run/no-delete mode is enabled; standalone source files will be preserved.' -ForegroundColor Yellow
     } elseif ($DeleteStandalone) {
         $script:DeleteStandaloneSources = $true
         Write-Host 'CLI override enabled: original standalone NSP/XCI files will be deleted only after verification succeeds.' -ForegroundColor Yellow
     } else {
         $script:DeleteStandaloneSources = Read-YesNo -Prompt 'After successful verification, delete the original standalone .nsp/.xci files to save space?'
-        if ($script:DeleteStandaloneSources) {
-            Write-Host 'Original standalone NSP/XCI files will be deleted only after the compressed result is verified and successfully copied.' -ForegroundColor Yellow
-        } else {
-            Write-Host 'Standalone source files will be preserved after conversion.' -ForegroundColor Yellow
-        }
     }
 }
 
-if ($DeleteArchivesOnSuccess -and -not $script:DryRun -and -not $script:NoDelete) {
-    if ($DeleteArchives) {
-        $script:DeleteArchivesConfirmed = $true
+if ($script:Archives.Count -gt 0) {
+    if (-not (Test-DeleteAllowed)) {
+        $DeleteArchivesOnSuccess = $false
+    } elseif ($DeleteArchives) {
+        $DeleteArchivesOnSuccess = $true
         Write-Host 'CLI override enabled: original RAR archives will be removed after successful verification.' -ForegroundColor Yellow
     } else {
-        $script:DeleteArchivesConfirmed = Read-YesNo -Prompt 'After successful verification, delete the original RAR archive sets? This only happens after each eligible file is handled.' -DefaultNo:$true
-        if ($script:DeleteArchivesConfirmed) {
-            Write-Host 'RAR archives will be deleted only after every eligible file has been successfully handled.' -ForegroundColor Yellow
-        } else {
-            Write-Host 'RAR archives will be preserved after processing.' -ForegroundColor Yellow
-            $DeleteArchivesOnSuccess = $false
-        }
+        $DeleteArchivesOnSuccess = Read-YesNo -Prompt 'After successful verification, delete the original RAR archive sets? This only happens after every eligible file in a set is handled.'
     }
-} elseif ($DeleteArchivesOnSuccess) {
-    Write-Host 'Archive deletion is disabled by safety mode or explicit no-delete flag.' -ForegroundColor Yellow
-}
-
-if ($script:DryRun -or $script:NoDelete) {
-    Write-Host 'Safety mode active: files will not be deleted after processing.' -ForegroundColor Yellow
-}
-
-if ($DeleteArchivesOnSuccess) {
-    Write-Host 'Archive delete confirmation: enabled' -ForegroundColor Cyan
 } else {
-    Write-Host 'Archive delete confirmation: disabled' -ForegroundColor Yellow
+    $DeleteArchivesOnSuccess = $false
 }
+$DeleteArchivesOnSuccess = [bool]$DeleteArchivesOnSuccess
+$script:DeleteArchivesConfirmed = $DeleteArchivesOnSuccess
 
+# ------------------------------ Dry run -------------------------------
 if ($script:DryRun) {
     Write-Host ''
     Write-Host '===================== Dry run summary =====================' -ForegroundColor Cyan
     Write-Host "Source folder:            $SourceFolder"
     Write-Host "Destination:              $script:OutputFolder"
-    Write-Host "RAR archive sets:         $($script:Archives.Count)"
-    Write-Host "Loose NSP/XCI files:      $($script:StandaloneQueue.Count)"
+    Write-Host "RAR archive sets:         $($script:Archives.Count) of $($detectedArchives.Count) detected"
+    foreach ($archive in ($script:Archives | Select-Object -First 20)) { Write-Host "  - $($archive.Name)" }
+    if ($script:Archives.Count -gt 20) { Write-Host "  ... and $($script:Archives.Count - 20) more" }
+    Write-Host "Loose NSP/XCI files:      $($script:StandaloneQueue.Count) of $($looseCandidates.Count) found"
+    foreach ($loose in ($script:StandaloneQueue | Select-Object -First 20)) { Write-Host "  - $($loose.FullName)" }
+    if ($script:StandaloneQueue.Count -gt 20) { Write-Host "  ... and $($script:StandaloneQueue.Count - 20) more" }
+    Write-Host "WinRAR:                   $(if ($script:RarExe) { $script:RarExe } elseif ($detectedArchives.Count -gt 0) { 'NOT FOUND (would offer to install)' } else { 'not needed' })"
+    Write-Host "NSZ:                      $(if ($script:NszExe) { $script:NszExe } elseif ($needsCompression) { 'NOT FOUND (would offer to install)' } else { 'not needed' })"
+    Write-Host "Keys file:                $(if ($script:KeysFile) { $script:KeysFile } elseif ($script:NszExe) { 'NOT FOUND (would ask you to select one)' } else { 'n/a' })"
     Write-Host "Compression:              $($script:CompressionEnabled)"
-    Write-Host "Delete archives:          $DeleteArchivesOnSuccess"
-    Write-Host "Delete loose files:       $($script:DeleteStandaloneSources)"
-    Write-Host 'No files will be deleted during a dry run.' -ForegroundColor Yellow
+    Write-Host "Parallel extraction jobs: $MaxParallel"
+    Write-Host 'Nothing was extracted, converted, copied, installed, or deleted.' -ForegroundColor Yellow
     Write-Host '==========================================================' -ForegroundColor Cyan
-    Write-Host ''
+    Write-Log -Message "Dry run finished: archives=$($script:Archives.Count); loose=$($script:StandaloneQueue.Count); compression=$($script:CompressionEnabled)." -Level INFO
+    Wait-ForExit
+    Stop-RunLogging
+    exit 0
 }
 
 if ($script:Archives.Count -eq 0 -and $script:StandaloneQueue.Count -eq 0) {
@@ -1274,7 +1380,7 @@ if ($script:Archives.Count -eq 0 -and $script:StandaloneQueue.Count -eq 0) {
     }
     Write-Host "Diagnostic log: $script:DiagnosticsLogPath"
     Write-Host "Transcript:     $script:TranscriptPath"
-    Read-Host 'Press Enter to exit'
+    Wait-ForExit
     Stop-RunLogging
     exit 0
 }
@@ -1290,80 +1396,92 @@ Write-Host "NSP/XCI compression:      $compressionStatus"
 Write-Host "Loose files queued:       $($script:StandaloneQueue.Count)"
 Write-Host "Log folder:               $script:RunLogFolder"
 if ($script:CompressionEnabled) { Write-Host "NSZ executable:           $script:NszExe"; Write-Host "Keys file:                $script:KeysFile" }
-if ($DeleteArchivesOnSuccess) { Write-Host 'RAR archives are deleted only when every eligible extracted file has been successfully converted/copied.' -ForegroundColor Yellow }
-if (-not $DeleteArchivesOnSuccess) { Write-Host 'RAR archives will be kept because delete confirmation was not granted or safety mode is active.' -ForegroundColor Yellow }
+if ($script:Archives.Count -gt 0) {
+    if ($DeleteArchivesOnSuccess) {
+        Write-Host 'RAR archives: deleted only after every eligible extracted file has been converted/copied and verified.' -ForegroundColor Yellow
+    } else {
+        Write-Host 'RAR archives: kept.' -ForegroundColor Yellow
+    }
+}
+if ($script:StandaloneQueue.Count -gt 0) {
+    if ($script:DeleteStandaloneSources) {
+        Write-Host 'Loose NSP/XCI originals: deleted only after the compressed result is verified and in place.' -ForegroundColor Yellow
+    } else {
+        Write-Host 'Loose NSP/XCI originals: kept.' -ForegroundColor Yellow
+    }
+}
+if ($script:NoDelete) { Write-Host 'No-delete mode active: no source files will be deleted.' -ForegroundColor Yellow }
 Write-Host ''
 
-# ---------------------- Parallel archive extraction ----------------------
-$script:ProgressStage = 'Archives'
-$script:CurrentWork = 'Starting parallel extraction queue'
-while ($script:Active.Count -lt $MaxParallel -and $script:NextArchiveIndex -lt $script:Archives.Count) { Start-NextExtraction }
+try {
+    # ---------------------- Parallel archive extraction ----------------------
+    $script:ProgressStage = 'Archives'
+    $script:CurrentWork = 'Starting parallel extraction queue'
+    Start-PendingExtractions
 
-while ((-not $script:StopProcessing -and $script:NextArchiveIndex -lt $script:Archives.Count) -or $script:Active.Count -gt 0) {
-    # Refill any failed-to-start slots too; otherwise a Start-Job startup error could leave the queue stuck.
-    if (-not $script:StopProcessing) {
-        while ($script:Active.Count -lt $MaxParallel -and $script:NextArchiveIndex -lt $script:Archives.Count) { Start-NextExtraction }
-    }
-    $finished = @($script:Active | Where-Object { $_.Job.State -in @('Completed', 'Failed', 'Stopped') })
+    while (-not $script:StopProcessing -and ($script:NextArchiveIndex -lt $script:Archives.Count -or $script:Active.Count -gt 0)) {
+        # Refill any failed-to-start slots too; otherwise a Start-Job startup error could leave the queue stuck.
+        Start-PendingExtractions
+        $finished = @($script:Active | Where-Object { $_.Job.State -in @('Completed', 'Failed', 'Stopped') })
 
-    if ($finished.Count -gt 0) {
-        $finishedIds = @($finished | ForEach-Object { $_.Job.Id })
-        $script:Active = @($script:Active | Where-Object { $finishedIds -notcontains $_.Job.Id })
-
-        # Refill queue slots immediately: this is the rolling parallel queue, not sequential batches.
-        if (-not $script:StopProcessing) {
-            while ($script:Active.Count -lt $MaxParallel -and $script:NextArchiveIndex -lt $script:Archives.Count) { Start-NextExtraction }
+        foreach ($entry in $finished) {
+            $script:Active = @($script:Active | Where-Object { $_.Job.Id -ne $entry.Job.Id })
+            # Refill queue slots immediately: this is the rolling parallel queue, not sequential batches.
+            Start-PendingExtractions
+            $script:CurrentWork = "Processing extracted files: $($entry.Archive.Name)"
+            Process-FinishedArchive -Entry $entry
+            if ($script:StopProcessing) { break }
         }
+        $script:CurrentWork = ''
 
-        foreach ($entry in $finished) { Process-FinishedArchive -Entry $entry }
-    }
-
-    Update-ProgressDashboard
-    if ($finished.Count -eq 0) { Start-Sleep -Milliseconds 300 }
-}
-
-# If Q was selected, any active extraction jobs are allowed to finish, but their files are not processed and their archives are kept.
-foreach ($entry in @($script:Active)) {
-    try { if ($entry.Job.State -eq 'Running') { Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue } } catch {}
-    Remove-ExtractionTemp -Folder $entry.TempFolder -Job $entry.Job
-}
-$script:Active = @()
-
-# ---------------------- Previously extracted files ----------------------
-if ($script:CompressionEnabled -and $script:StandaloneQueue.Count -gt 0 -and -not $script:StopProcessing) {
-    $script:ProgressStage = 'Standalone'
-    $script:CurrentWork = 'Starting standalone NSP/XCI conversions'
-    while ($script:StandaloneNextIndex -lt $script:StandaloneQueue.Count -and -not $script:StopProcessing) {
-        $file = $script:StandaloneQueue[$script:StandaloneNextIndex]
-        $script:StandaloneNextIndex++
-        $script:CurrentWork = "Converting existing file: $($file.Name)"
         Update-ProgressDashboard
-        $result = Process-OneFile -File $file -IsStandalone:$true
-        if ($result -notin @('Copy', 'Overwrite', 'KeepBoth')) {
-            if ($result -eq 'Quit') { break }
+        if ($finished.Count -eq 0) { Start-Sleep -Milliseconds 300 }
+    }
+    Clear-ProgressDashboard
+
+    # ---------------------- Previously extracted files ----------------------
+    if ($script:CompressionEnabled -and $script:StandaloneQueue.Count -gt 0 -and -not $script:StopProcessing) {
+        $script:ProgressStage = 'Standalone'
+        $script:CurrentWork = 'Starting standalone NSP/XCI conversions'
+        while ($script:StandaloneNextIndex -lt $script:StandaloneQueue.Count -and -not $script:StopProcessing) {
+            $file = $script:StandaloneQueue[$script:StandaloneNextIndex]
+            $script:StandaloneNextIndex++
+            $script:CurrentWork = "Converting existing file: $($file.Name)"
+            Update-ProgressDashboard
+            $result = Process-OneFile -File $file -IsStandalone:$true
+            if ($result.Action -eq 'Quit') { break }
+            $script:StandaloneProcessedCount++
+            Update-ProgressDashboard
         }
-        $script:StandaloneProcessedCount++
-        Update-ProgressDashboard
+        Clear-ProgressDashboard
     }
+} finally {
+    # Runs on normal completion, on Q, and on Ctrl+C: stop outstanding jobs and remove temporary files.
+    foreach ($entry in @($script:Active)) {
+        try { if ($entry.Job.State -in @('NotStarted', 'Running')) { Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue } } catch {}
+        Remove-ExtractionTemp -Folder $entry.TempFolder -Job $entry.Job
+        Write-Log -Message "Stopped unfinished extraction job for '$($entry.Archive.Name)'; source archive kept." -Level WARN
+    }
+    $script:Active = @()
+    Remove-StagingRoot
+    Clear-ProgressDashboard
 }
 
-    if ($script:DryRun) {
-        Write-Host 'Dry-run mode enabled: no source archives or loose files were deleted.' -ForegroundColor Yellow
-    }
+$failureTotal = $script:ErrorCount + $script:FailedCopyCount + $script:ConversionErrorCount
 Write-Host ''
 Write-Host '==================== Run summary ====================' -ForegroundColor Cyan
-Write-Host "Source folder:             $SourceFolder"
+Write-Host "Source folder:            $SourceFolder"
 Write-Host "Output folder:            $script:OutputFolder"
 Write-Host "Archives detected:        $($detectedArchives.Count)"
 Write-Host "Archives processed:       $($script:CompletedArchives)"
-Write-Host "Archives deleted:         $($script:DeletedArchiveCount)"
+Write-Host "Archives deleted (files): $($script:DeletedArchiveCount)"
 Write-Host "Loose files processed:    $($script:StandaloneProcessedCount)"
-Write-Host "Copied to output:         $($script:CopiedCount)"
+Write-Host "Moved to output:          $($script:CopiedCount)"
 Write-Host "Skipped:                  $($script:SkippedCount)"
 Write-Host "Copy failures:            $($script:FailedCopyCount)"
 Write-Host "Extraction errors:        $($script:ErrorCount)"
 Write-Host "Warnings:                 $($script:WarningCount)"
-Write-Host "Compression successes:   $($script:ConversionSuccessCount)"
+Write-Host "Compression successes:    $($script:ConversionSuccessCount)"
 Write-Host "Compression failures:     $($script:ConversionErrorCount)"
 Write-Host "Diagnostic log:           $script:DiagnosticsLogPath"
 Write-Host "Transcript log:           $script:TranscriptPath"
@@ -1374,5 +1492,7 @@ if (-not $script:CompressionEnabled -and ($detectedArchives.Count -gt 0 -or $loo
 Write-Host '====================================================' -ForegroundColor Cyan
 Write-Log -Message "Run summary: archivesDetected=$($detectedArchives.Count); archivesProcessed=$($script:CompletedArchives); archivesDeleted=$($script:DeletedArchiveCount); copied=$($script:CopiedCount); skipped=$($script:SkippedCount); copyFailures=$($script:FailedCopyCount); extractionErrors=$($script:ErrorCount); extractionWarnings=$($script:WarningCount); conversionsPassed=$($script:ConversionSuccessCount); conversionErrors=$($script:ConversionErrorCount); standaloneProcessed=$($script:StandaloneProcessedCount)/$($script:TotalStandalone)." -Level INFO
 Write-Log -Message "Run finished. Transcript='$script:TranscriptPath'; diagnosticLog='$script:DiagnosticsLogPath'." -Level INFO
-Read-Host 'Press Enter to exit'
+Wait-ForExit
 Stop-RunLogging
+# Nonzero exit code lets scheduled/automated runs detect failures.
+exit $(if ($failureTotal -gt 0) { 1 } else { 0 })

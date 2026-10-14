@@ -50,14 +50,29 @@ This project was created and iteratively improved with GitHub Copilot as a codin
 
 ```powershell
 .\Extract-Parts.ps1 -SourceFolder "D:\Roms" -OutputFolder "D:\Extracted" -DeleteArchives -DeleteStandalone
-.\Extract-Parts.ps1 -NonInteractive -DryRun
-.\Extract-Parts.ps1 -NonInteractive -DeleteArchives
+.\Extract-Parts.ps1 -NonInteractive -SourceFolder "D:\Roms" -DryRun
+.\Extract-Parts.ps1 -NonInteractive -SourceFolder "D:\Roms" -DeleteArchives
+.\Extract-Parts.ps1 -SourceFolder "D:\Roms" -MaxParallel 2
 ```
+
+| Parameter | Meaning |
+| --- | --- |
+| `-SourceFolder` | Folder containing RAR sets / loose `.nsp`/`.xci` files. Required with `-NonInteractive`. |
+| `-OutputFolder` | Destination folder. Defaults to a picker (interactive) or `<source>\Extracted` (non-interactive). |
+| `-DeleteArchives` | Delete each RAR set after all its files are verified in the output folder. |
+| `-DeleteStandalone` | Delete loose `.nsp`/`.xci` originals after the compressed copy is verified. |
+| `-DryRun` | Report what would be processed, then exit. Nothing is extracted, converted, installed or deleted. |
+| `-NoDelete` | Process everything but never delete source files. |
+| `-NonInteractive` | No dialogs or prompts: yes/no prompts answer "no", duplicate filenames are skipped. Exit code 1 on failures. |
+| `-Force` | With `-NonInteractive`, auto-approve dependency installs (never deletions). |
+| `-MaxParallel` | Concurrent WinRAR jobs (1-32, default 6). Use a lower value for spinning hard drives. |
 
 ## Notes
 
 - If command-line flags are supplied, they take precedence over the interactive prompts.
 - If you run in non-interactive mode, the script prefers safe defaults.
+- Password-protected archives are reported as failures instead of waiting for a password.
+- Temporary files are staged in a hidden `.ExtractParts_staging_*` folder inside the output folder and removed at the end of the run (including after Ctrl+C).
 - The script logs details to the local app data logs directory and keeps a transcript for troubleshooting.
 
 ## License
